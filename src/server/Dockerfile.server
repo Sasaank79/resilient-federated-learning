@@ -1,0 +1,58 @@
+# ============================================================
+# Dockerfile.server -- Federated Learning Aggregator
+# ============================================================
+# Lightweight image for the Flower gRPC aggregation server.
+# Runs the FedProx strategy with async timeouts.
+#
+# Build context: project root (resilient-federated-healthcare/)
+# ============================================================
+
+FROM python:3.10-slim
+
+# ============================================================
+# Set working directory
+# ============================================================
+WORKDIR /app
+
+# ============================================================
+# Install system dependencies (minimal)
+# ============================================================
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential && \
+    rm -rf /var/lib/apt/lists/*
+
+# ============================================================
+# Install Python dependencies
+# ============================================================
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# ============================================================
+# Copy server source code and shared modules
+# ============================================================
+COPY src/__init__.py ./src/__init__.py
+COPY src/server/ ./src/server/
+COPY src/models/ ./src/models/
+COPY utils/ ./utils/
+
+# ============================================================
+# Create logs directory
+# ============================================================
+RUN mkdir -p /app/logs
+
+# ============================================================
+# Expose gRPC port for client connections
+# ============================================================
+EXPOSE 8080
+
+# ============================================================
+# Health check -- verify Python and server module are importable
+# ============================================================
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
+    CMD python -c "from src.server.server_app import FedProxStrategy; print('OK')" || exit 1
+
+# ============================================================
+# Start the aggregation server
+# ============================================================
+CMD ["python", "-m", "src.server.server_app"]

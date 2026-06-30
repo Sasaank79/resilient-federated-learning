@@ -1,0 +1,57 @@
+# ============================================================
+# Dockerfile.client -- Federated Learning Hospital Client
+# ============================================================
+# Lightweight image for a hospital node running Opacus DP-SGD
+# training with FedProx and chaos engineering simulation.
+#
+# Build context: project root (resilient-federated-healthcare/)
+#
+# Required environment variables at runtime:
+#   HOSPITAL_ID    : "hospital_a" or "hospital_b"
+#   SERVER_ADDRESS : e.g. "aggregator:8080"
+# ============================================================
+
+FROM python:3.10-slim
+
+# ============================================================
+# Set working directory
+# ============================================================
+WORKDIR /app
+
+# ============================================================
+# Install system dependencies (minimal)
+# ============================================================
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential && \
+    rm -rf /var/lib/apt/lists/*
+
+# ============================================================
+# Install Python dependencies
+# ============================================================
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# ============================================================
+# Copy client source code and shared modules
+# ============================================================
+COPY src/__init__.py ./src/__init__.py
+COPY src/client/ ./src/client/
+COPY src/models/ ./src/models/
+COPY utils/ ./utils/
+
+# ============================================================
+# Create directories for data and logs
+# ============================================================
+RUN mkdir -p /app/data /app/logs
+
+# ============================================================
+# Health check -- verify Python and client module are importable
+# ============================================================
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD python -c "from src.client.client_app import HospitalClient; print('OK')" || exit 1
+
+# ============================================================
+# Start the hospital client
+# ============================================================
+CMD ["python", "-m", "src.client.client_app"]

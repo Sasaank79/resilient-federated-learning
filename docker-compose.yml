@@ -1,0 +1,158 @@
+# ============================================================
+# docker-compose.yml -- Resilient Federated Learning Network
+# ============================================================
+# One-click orchestration of the entire federated learning pipeline:
+#   - aggregator:  Flower gRPC server with FedProx strategy
+#   - hospital_a:  Client with healthy cell data (classes 0-3)
+#   - hospital_b:  Client with diseased cell data (classes 4-7)
+#
+# Network Isolation:
+#   Each hospital is on its own internal bridge network that can
+#   ONLY reach the aggregator. Hospitals cannot communicate with
+#   each other, share volumes, or ping one another.
+#
+#   hospital_a_net (internal) <--> aggregator <--> hospital_b_net (internal)
+#                                     |
+#                                fl_server_net (external access for gRPC)
+#
+# Usage:
+#   docker-compose build
+#   docker-compose up
+#   docker-compose down
+# ============================================================
+
+version: "3.9"
+
+# ============================================================
+# Network Definitions -- Strict Isolation
+# ============================================================
+networks:
+  # ----------------------------------------------------------
+  # Server network -- aggregator listens here
+  # Not marked internal so the aggregator can bind to host port
+  # ----------------------------------------------------------
+  fl_server_net:
+    driver: bridge
+
+  # ----------------------------------------------------------
+  # Hospital A isolated network
+  # "internal: true" prevents any external/internet access
+  # Only the aggregator and hospital_a are on this network
+  # ----------------------------------------------------------
+  hospital_a_net:
+    driver: bridge
+    internal: true
+
+  # ----------------------------------------------------------
+  # Hospital B isolated network
+  # "internal: true" prevents any external/internet access
+  # Only the aggregator and hospital_b are on this network
+  # ----------------------------------------------------------
+  hospital_b_net:
+    driver: bridge
+    internal: true
+
+# ============================================================
+# Service Definitions
+# ============================================================
+services:
+
+  # ----------------------------------------------------------
+  # Aggregator -- Central Flower gRPC Server
+  # ----------------------------------------------------------
+  # Runs the FedProx strategy with 60-second round timeouts.
+  # Connected to all three networks so both hospitals can
+  # reach it, but the hospitals cannot reach each other.
+  # ----------------------------------------------------------
+  aggregator:
+    build:
+      context: .
+      dockerfile: src/server/Dockerfile.server
+    container_name: fl_aggregator
+    ports:
+      - "8080:8080"
+    networks:
+      - fl_server_net
+      - hospital_a_net
+      - hospital_b_net
+    environment:
+      - NUM_ROUNDS=20
+      - MIN_FIT_CLIENTS=2
+      - MIN_AVAIL_CLIENTS=2
+      - FRACTION_FIT=1.0
+      - MU=0.1
+      - LOCAL_EPOCHS=3
+      - LEARNING_RATE=0.01
+      - SERVER_PORT=8080
+      - ROUND_TIMEOUT=60.0
+      - LOG_DIR=/app/logs
+    volumes:
+      # --------------------------------------------------
+      # Persist server logs to host for inspection
+      # --------------------------------------------------
+      - ./logs:/app/logs
+    restart: unless-stopped
+
+  # ----------------------------------------------------------
+  # Hospital A -- Healthy Cell Data (Classes 0-3)
+  # ----------------------------------------------------------
+  # Connected ONLY to hospital_a_net (internal).
+  # Can reach the aggregator (also on hospital_a_net) but
+  # CANNOT reach hospital_b or any external network.
+  # No shared volumes with hospital_b.
+  # ----------------------------------------------------------
+  hospital_a:
+    build:
+      context: .
+      dockerfile: src/client/Dockerfile.client
+    container_name: fl_hospital_a
+    networks:
+      - hospital_a_net
+    environment:
+      - HOSPITAL_ID=hospital_a
+      - SERVER_ADDRESS=aggregator:8080
+      - EPSILON=10.0
+      - MU=0.1
+      - LOCAL_EPOCHS=3
+      - BATCH_SIZE=32
+      - LEARNING_RATE=0.01
+      - STRAGGLER_PROB=0.3
+      - DROPOUT_PROB=0.15
+      - DATA_DIR=/app/data
+      - MAX_GRAD_NORM=1.0
+      - DP_DELTA=1e-5
+    depends_on:
+      - aggregator
+    restart: unless-stopped
+
+  # ----------------------------------------------------------
+  # Hospital B -- Diseased Cell Data (Classes 4-7)
+  # ----------------------------------------------------------
+  # Connected ONLY to hospital_b_net (internal).
+  # Can reach the aggregator (also on hospital_b_net) but
+  # CANNOT reach hospital_a or any external network.
+  # No shared volumes with hospital_a.
+  # ----------------------------------------------------------
+  hospital_b:
+    build:
+      context: .
+      dockerfile: src/client/Dockerfile.client
+    container_name: fl_hospital_b
+    networks:
+      - hospital_b_net
+    environment:
+      - HOSPITAL_ID=hospital_b
+      - SERVER_ADDRESS=aggregator:8080
+      - EPSILON=10.0
+      - MU=0.1
+      - LOCAL_EPOCHS=3
+      - BATCH_SIZE=32
+      - LEARNING_RATE=0.01
+      - STRAGGLER_PROB=0.3
+      - DROPOUT_PROB=0.15
+      - DATA_DIR=/app/data
+      - MAX_GRAD_NORM=1.0
+      - DP_DELTA=1e-5
+    depends_on:
+      - aggregator
+    restart: unless-stopped
