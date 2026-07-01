@@ -22,8 +22,45 @@ Usage:
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torchvision import models
+from torchvision.models.resnet import BasicBlock
 from opacus.validators import ModuleValidator
+
+
+# ============================================================
+# Monkeypatch: Fix in-place residual addition for Opacus
+# ============================================================
+# Opacus hooks into backward passes to compute per-sample gradients.
+# The default BasicBlock.forward uses in-place addition (out += identity)
+# on the skip connection, which causes:
+#   'Output 0 of BackwardHookFunctionBackward is a view and is being
+#    modified inplace.'
+# We replace it with standard addition (out = out + identity) so the
+# autograd graph remains intact for Opacus's per-sample gradient hooks.
+# ============================================================
+def _patched_basicblock_forward(self, x: torch.Tensor) -> torch.Tensor:
+    identity = x
+
+    out = self.conv1(x)
+    out = self.bn1(out)
+    out = self.relu(out)
+
+    out = self.conv2(out)
+    out = self.bn2(out)
+
+    if self.downsample is not None:
+        identity = self.downsample(x)
+
+    # --- PATCHED: out-of-place addition instead of out += identity ---
+    out = out + identity
+    out = self.relu(out)
+
+    return out
+
+
+# Apply the monkeypatch globally before any model instantiation
+BasicBlock.forward = _patched_basicblock_forward
 
 # ============================================================
 # Default model hyperparameters
@@ -89,6 +126,16 @@ class MedResNet18(nn.Module):
         # BatchNorm layers with GroupNorm equivalents.
         # --------------------------------------------------------
         backbone = ModuleValidator.fix(backbone)
+
+        # --------------------------------------------------------
+        # Modification 3b: Disable in-place operations globally
+        # Opacus per-sample gradient hooks are incompatible with
+        # any in-place tensor operations (e.g., ReLU(inplace=True)).
+        # We iterate over all submodules and force inplace=False.
+        # --------------------------------------------------------
+        for module in backbone.modules():
+            if hasattr(module, "inplace"):
+                module.inplace = False
 
         # --------------------------------------------------------
         # Modification 4: Replace classifier with Dropout + FC
