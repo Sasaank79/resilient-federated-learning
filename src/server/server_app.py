@@ -68,7 +68,7 @@ MU = float(os.environ.get("MU", "0.1"))
 LOCAL_EPOCHS = int(os.environ.get("LOCAL_EPOCHS", "3"))
 LEARNING_RATE = float(os.environ.get("LEARNING_RATE", "0.01"))
 SERVER_PORT = int(os.environ.get("SERVER_PORT", "8080"))
-ROUND_TIMEOUT = float(os.environ.get("ROUND_TIMEOUT", "60.0"))
+ROUND_TIMEOUT = float(os.environ.get("ROUND_TIMEOUT", "300.0"))
 LOG_DIR = os.environ.get("LOG_DIR", "logs")
 
 # ============================================================

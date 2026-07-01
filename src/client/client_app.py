@@ -50,6 +50,7 @@ from flwr.common import NDArrays, Scalar
 
 from opacus import PrivacyEngine
 from opacus.validators import ModuleValidator
+from opacus.utils.batch_memory_manager import BatchMemoryManager
 
 # ============================================================
 # Add project root to Python path for imports
@@ -75,7 +76,7 @@ EPSILON = float(os.environ.get("EPSILON", "10.0"))
 MU = float(os.environ.get("MU", "0.1"))
 
 # Training hyperparameters
-LOCAL_EPOCHS = int(os.environ.get("LOCAL_EPOCHS", "3"))
+LOCAL_EPOCHS = int(os.environ.get("LOCAL_EPOCHS", "1"))
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "32"))
 LEARNING_RATE = float(os.environ.get("LEARNING_RATE", "0.01"))
 
@@ -87,6 +88,7 @@ DROPOUT_PROB = float(os.environ.get("DROPOUT_PROB", "0.15"))
 DATA_DIR = os.environ.get("DATA_DIR", "./data")
 MAX_GRAD_NORM = float(os.environ.get("MAX_GRAD_NORM", "1.0"))
 DP_DELTA = float(os.environ.get("DP_DELTA", "1e-5"))
+MAX_PHYSICAL_BATCH_SIZE = int(os.environ.get("MAX_PHYSICAL_BATCH_SIZE", "16"))
 
 # ============================================================
 # Device configuration
@@ -173,6 +175,16 @@ def train_one_round(
       2. Trains for `local_epochs` with the FedProx proximal term
       3. Tracks and reports the privacy budget spent
 
+    FedProx + Opacus Interaction:
+      The FedProx proximal gradient is injected AFTER loss.backward()
+      but BEFORE optimizer.step(). This is critical because:
+        - loss.backward() must only see the data-dependent cross-entropy
+          loss so Opacus can cleanly compute per-sample gradients and
+          clip them individually.
+        - The proximal gradient d/dw[(mu/2)||w-w*||^2] = mu*(w-w*) is
+          NOT data-dependent, so it does not need per-sample clipping.
+          We add it directly to .grad before the optimizer step.
+
     Args:
         model: The neural network model to train.
         train_loader: DataLoader for this hospital's training data.
@@ -223,6 +235,12 @@ def train_one_round(
     # --------------------------------------------------------
     # Local training loop with FedProx proximal term
     # --------------------------------------------------------
+    # BatchMemoryManager splits large logical batches into smaller
+    # physical micro-batches for memory efficiency. This is critical
+    # for Opacus on CPU — per-sample gradients require O(batch_size)
+    # memory multiplier. Smaller physical batches keep memory bounded
+    # while maintaining the same privacy accounting.
+    # --------------------------------------------------------
     total_loss = 0.0
     total_samples = 0
 
@@ -230,36 +248,56 @@ def train_one_round(
         epoch_loss = 0.0
         epoch_samples = 0
 
-        for batch_idx, (data, target) in enumerate(train_loader):
-            data = data.to(DEVICE)
-            # BloodMNIST labels are shape (batch, 1), squeeze to (batch,)
-            target = target.squeeze().long().to(DEVICE)
+        with BatchMemoryManager(
+            data_loader=train_loader,
+            max_physical_batch_size=MAX_PHYSICAL_BATCH_SIZE,
+            optimizer=optimizer,
+        ) as memory_safe_loader:
+            for batch_idx, (data, target) in enumerate(memory_safe_loader):
+                data = data.to(DEVICE)
+                # BloodMNIST labels are shape (batch, 1), squeeze to (batch,)
+                target = target.squeeze().long().to(DEVICE)
 
-            optimizer.zero_grad()
+                optimizer.zero_grad()
 
-            # Forward pass
-            output = model(data)
-            loss = criterion(output, target)
+                # Forward pass — data-dependent loss ONLY
+                output = model(data)
+                loss = criterion(output, target)
 
-            # ------------------------------------------------
-            # FedProx proximal term: (mu/2) * ||w - w_global||^2
-            # This penalizes local model drift from the global
-            # model, critical for Non-IID data convergence.
-            # ------------------------------------------------
-            proximal_term = 0.0
-            for local_w, global_w in zip(
-                model.parameters(), global_params_device
-            ):
-                proximal_term += (local_w - global_w).norm(2) ** 2
-            loss = loss + (mu / 2.0) * proximal_term
+                # ------------------------------------------------
+                # Backward pass — Opacus computes per-sample
+                # gradients and clips them. Only the data-dependent
+                # cross-entropy loss goes through backward() so
+                # Opacus's hooks can work cleanly without conflicts.
+                # ------------------------------------------------
+                loss.backward()
 
-            # Backward pass (Opacus handles per-sample gradient clipping + noise)
-            loss.backward()
-            optimizer.step()
+                # ------------------------------------------------
+                # FedProx proximal gradient injection (post-backward)
+                #
+                # The proximal term gradient:
+                #   d/dw [(mu/2) * ||w - w_global||^2] = mu * (w - w_global)
+                #
+                # This is NOT data-dependent (it only depends on model
+                # weights, not individual patient images), so it does
+                # not need per-sample DP clipping. We inject it directly
+                # into .grad after Opacus has finished its per-sample
+                # clipping, but before optimizer.step() applies the update.
+                # ------------------------------------------------
+                with torch.no_grad():
+                    for local_w, global_w in zip(
+                        model.parameters(), global_params_device
+                    ):
+                        if local_w.grad is not None:
+                            local_w.grad.add_(
+                                mu * (local_w.data - global_w.data)
+                            )
 
-            batch_size = data.size(0)
-            epoch_loss += loss.item() * batch_size
-            epoch_samples += batch_size
+                optimizer.step()
+
+                batch_size = data.size(0)
+                epoch_loss += loss.item() * batch_size
+                epoch_samples += batch_size
 
         avg_epoch_loss = epoch_loss / max(epoch_samples, 1)
         logger.info(
